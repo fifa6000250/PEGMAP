@@ -55,6 +55,10 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 (function(){
+  // To let everyone see the same Pegmen, paste your Firebase Realtime Database URL here.
+  // Example: 'https://my-project-default-rtdb.firebaseio.com'   (leave empty = saved only on this device)
+  var DB_URL='';
+
   var toast=document.getElementById('toast');
   function say(t){toast.textContent=t;toast.classList.add('on');clearTimeout(say.t);say.t=setTimeout(function(){toast.classList.remove('on')},3500)}
   if(typeof L==='undefined'){say('Could not load the map library. Check your internet connection.');return}
@@ -75,7 +79,7 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
   sat.on('tileerror',function(){if(!warned){warned=true;say('Some satellite tiles failed to load. Check your internet connection.')}});
 
   // ---- placed pegmen are pinned to map coordinates ----
-  var all=[];
+  var all=[],byId={},pending={},deleted={};
   function place(d){
     var p=map.latLngToContainerPoint(d._ll),sz=map.getSize();
     var wp=256*Math.pow(2,map.getZoom());
@@ -99,13 +103,13 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
     gp.style.transform='rotate('+a+'deg)';
     raf=requestAnimationFrame(loop);
   }
-  function makePlaced(name){
-    var d=document.createElement('div');d.className='placed';
+  function makePlaced(name,id){
+    var d=document.createElement('div');d.className='placed';d._id=id||('p'+Date.now().toString(36)+Math.random().toString(36).slice(2,6));byId[d._id]=d;
     d.innerHTML='<input class="tag" maxlength="16" spellcheck="false"><div class="spot"></div><div class="pegman"><i class="h"></i><i class="b"></i><i class="l"></i><i class="r"></i></div>';
     var t=d.querySelector('.tag');t.value=name;
     t.addEventListener('pointerdown',function(e){e.stopPropagation()});
     t.addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter')t.blur()});
-    t.addEventListener('blur',function(){if(!t.value.trim())t.value=name;save()});
+    t.addEventListener('blur',function(){if(!t.value.trim())t.value=name;save();sync(d)});
     d.addEventListener('pointerdown',function(e){startDrag(e,d)});
     document.body.appendChild(d);all.push(d);
     return d;
@@ -131,7 +135,7 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
     window.removeEventListener('pointerup',onUp);
     var r=peg.getBoundingClientRect();
     if(e.clientX>=r.left&&e.clientX<=r.right&&e.clientY>=r.top&&e.clientY<=r.bottom){
-      if(current){current.remove();all.splice(all.indexOf(current),1)}
+      if(current){var gone=current._id;current.remove();all.splice(all.indexOf(current),1);delete byId[gone];unsync(gone)}
       current=null;save();return;
     }
     var isNew=!current;
@@ -139,7 +143,7 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
     p._ll=map.containerPointToLatLng(L.point(e.clientX,e.clientY-yoff+30));
     place(p);p.style.display='flex';
     if(isNew&&!yoff){var ti=p.querySelector('.tag');ti.focus();ti.select()}
-    current=null;save();
+    current=null;save();sync(p);
   }
   peg.addEventListener('pointerdown',function(e){startDrag(e,null)});
 
@@ -152,10 +156,10 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
     list.forEach(function(it){
       if(!it||typeof it.lat!=='number'||typeof it.lng!=='number')return;
       var d=makePlaced(String(it.name||'Pegman').slice(0,16));
-      d._ll=L.latLng(it.lat,it.lng);place(d);d.style.display='flex';count++;
+      d._ll=L.latLng(it.lat,it.lng);place(d);d.style.display='flex';count++;sync(d);
     });
   }
-  try{restore(JSON.parse(localStorage.getItem(KEY)||'[]'))}catch(e){}
+  if(!DB_URL){try{restore(JSON.parse(localStorage.getItem(KEY)||'[]'))}catch(e){}}
   document.getElementById('exp').onclick=function(){
     var b=new Blob([JSON.stringify(snapshot(),null,2)],{type:'application/json'});
     var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='pegmen.json';
@@ -169,6 +173,42 @@ html,body{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;-webkit-
     r.onload=function(){try{restore(JSON.parse(r.result));save();say('Loaded')}catch(err){say('Could not read that file')}};
     r.readAsText(f);e.target.value='';
   };
+
+  // ---- shared map: everyone who opens this page sees the same Pegmen ----
+  function api(path){return DB_URL.replace(/\/$/,'')+'/pegmen'+path+'.json'}
+  function sync(d){
+    if(!DB_URL)return;
+    d._t=Date.now();pending[d._id]=(pending[d._id]||0)+1;
+    fetch(api('/'+d._id),{method:'PUT',body:JSON.stringify({name:d.querySelector('.tag').value,lat:d._ll.lat,lng:d._ll.lng})})
+      .catch(function(){say('Could not save to the shared map.')})
+      .then(function(){pending[d._id]--});
+  }
+  function unsync(id){
+    if(!DB_URL)return;
+    deleted[id]=Date.now();pending[id]=(pending[id]||0)+1;
+    fetch(api('/'+id),{method:'DELETE'}).catch(function(){}).then(function(){pending[id]--});
+  }
+  var shownErr=false;
+  function poll(){
+    fetch(api('')).then(function(r){if(!r.ok)throw new Error(r.status);return r.json()}).then(function(data){
+      data=data||{};
+      Object.keys(data).forEach(function(id){
+        var v=data[id];if(!v||typeof v.lat!=='number'||typeof v.lng!=='number')return;
+        if(deleted[id]&&Date.now()-deleted[id]<8000)return;
+        var d=byId[id];
+        if(!d){d=makePlaced(String(v.name||'Pegman').slice(0,16),id);d._ll=L.latLng(v.lat,v.lng);place(d);d.style.display='flex';return}
+        if(d===current||pending[id]||Date.now()-(d._t||0)<6000)return;
+        d._ll=L.latLng(v.lat,v.lng);place(d);
+        var t=d.querySelector('.tag');if(document.activeElement!==t)t.value=String(v.name||'').slice(0,16);
+      });
+      all.slice().forEach(function(d){
+        if(d===current||pending[d._id]||Date.now()-(d._t||0)<6000||(d._id in data))return;
+        d.remove();all.splice(all.indexOf(d),1);delete byId[d._id];
+      });
+      shownErr=false;
+    }).catch(function(){if(!shownErr){shownErr=true;say('Cannot reach the shared map. Check the database URL and your internet.')}});
+  }
+  if(DB_URL){poll();setInterval(poll,4000)}
 })();
 </script>
 </body>
